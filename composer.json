@@ -1,0 +1,22 @@
+{
+  "name": "lingner/lin-typo3-health",
+  "type": "typo3-cms-extension",
+  "description": "Bearer-protected health endpoint (/_api/health) with database, PHP-FPM, scheduler and system metrics",
+  "require": {
+    "typo3/cms-core": "^12.4",
+    "typo3/cms-scheduler": "^12.4"
+  },
+  "replace": {
+    "lin_typo3_health": "self.version"
+  },
+  "extra": {
+    "typo3/cms": {
+      "extension-key": "lin_typo3_health"
+    }
+  },
+  "autoload": {
+    "psr-4": {
+      "LINGNER\\LinTypo3Health\\": "Classes/"
+    }
+  }
+}
