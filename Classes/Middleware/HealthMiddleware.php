@@ -4,6 +4,11 @@ declare(strict_types=1);
 
 namespace LINGNER\LinTypo3Health\Middleware;
 
+use ApacheSolrForTypo3\Solr\ConnectionManager;
+use ApacheSolrForTypo3\Solr\Domain\Site\Site as SolrSite;
+use ApacheSolrForTypo3\Solr\Domain\Site\SiteRepository as SolrSiteRepository;
+use ApacheSolrForTypo3\Solr\System\Solr\SolrConnection;
+use LINGNER\LinTypo3Health\Formatter\PrometheusFormatter;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
@@ -11,12 +16,17 @@ use Psr\Http\Server\RequestHandlerInterface;
 use Psr\Log\LoggerInterface;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Http\JsonResponse;
+use TYPO3\CMS\Core\Http\Response;
+use TYPO3\CMS\Core\Information\Typo3Version;
+use TYPO3\CMS\Core\Utility\ExtensionManagementUtility;
+use TYPO3\CMS\Core\Utility\GeneralUtility;
 
 /**
- * GET /_api/health: database, PHP-FPM, scheduler and system metrics for monitoring.
+ * GET /_api/health: database, PHP-FPM, scheduler, Solr and system metrics for monitoring.
  *
  * - Bearer token via `Authorization` or `X-Authorization`; disabled without token.
  * - 200 for ok/degraded, 503 if the database is unreachable.
+ * - `?format=prometheus` returns the Prometheus text format, always with 200.
  * - Counters are cumulative since server start, graph their rate.
  * - Runs before frontend user authentication
  */
@@ -32,6 +42,7 @@ class HealthMiddleware implements MiddlewareInterface
         'Aborted_connects',
         'Innodb_row_lock_current_waits',
         'Slow_queries',
+        'Questions',
         'Uptime',
     ];
 
@@ -44,6 +55,11 @@ class HealthMiddleware implements MiddlewareInterface
     private const WARN_SCHEDULER_IDLE_SECONDS = 900;
     private const WARN_TASK_OVERDUE_SECONDS = 3600;
     private const WARN_TASK_RUNNING_SECONDS = 3600;
+    private const WARN_SOLR_HEAP_RATIO = 0.9;
+    private const WARN_SOLR_QUEUE_STALLED_SECONDS = 3600;
+
+    // EXT:solr PingFailedException codes: no HTTP response vs. error response
+    private const SOLR_PING_NO_RESPONSE = 1645716101;
 
     public function __construct(
         private readonly ConnectionPool $connectionPool,
@@ -76,6 +92,7 @@ class HealthMiddleware implements MiddlewareInterface
         $database = $this->collectDatabase($warnings);
         $fpm = $this->collectFpm($warnings);
         $scheduler = $database['reachable'] ? $this->collectScheduler($warnings) : null;
+        $solr = $database['reachable'] ? $this->collectSolr($warnings) : null;
         $system = $this->collectSystem($warnings);
 
         $status = match (true) {
@@ -84,11 +101,14 @@ class HealthMiddleware implements MiddlewareInterface
             default => 'ok',
         };
 
-        return $this->json([
+        $payload = [
             'status' => $status,
             'warnings' => $warnings,
             'hostname' => gethostname() ?: null,
             'time' => gmdate('c'),
+            'typo3' => [
+                'version' => (new Typo3Version())->getVersion(),
+            ],
             'php' => [
                 'version' => PHP_VERSION,
                 'sapi' => PHP_SAPI,
@@ -98,9 +118,16 @@ class HealthMiddleware implements MiddlewareInterface
             'database' => $database,
             'fpm' => $fpm,
             'scheduler' => $scheduler,
+            'solr' => $solr,
             'system' => $system,
             'durationMs' => round((microtime(true) - $startedAt) * 1000, 1),
-        ], $status === 'error' ? 503 : 200);
+        ];
+
+        if (($request->getQueryParams()['format'] ?? null) === 'prometheus') {
+            return $this->prometheus($payload);
+        }
+
+        return $this->json($payload, $status === 'error' ? 503 : 200);
     }
 
     private function isAuthorized(ServerRequestInterface $request, string $expectedToken): bool
@@ -279,6 +306,179 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
+     * Cores of all sites, one server info per Solr server and the index queue.
+     * Null without EXT:solr. Messages may contain hosts, so they are logged only.
+     *
+     * @param list<string> $warnings
+     * @return array<string, mixed>|null
+     */
+    private function collectSolr(array &$warnings): ?array
+    {
+        if (!ExtensionManagementUtility::isLoaded('solr')) {
+            return null;
+        }
+
+        try {
+            [$cores, $servers] = $this->collectSolrCores($warnings);
+            $indexQueue = $this->collectSolrIndexQueue($warnings);
+        } catch (\Throwable $e) {
+            $this->logger->error('Health check: Solr status not readable', ['exception' => $e]);
+            $warnings[] = 'Solr status not readable';
+            return null;
+        }
+
+        return [
+            'cores' => $cores,
+            'servers' => $servers,
+            'indexQueue' => $indexQueue,
+        ];
+    }
+
+    /**
+     * Once a server gives no HTTP response, its remaining cores are not pinged:
+     * a dead server costs one connect timeout instead of one per core.
+     *
+     * @param list<string> $warnings
+     * @return array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}
+     */
+    private function collectSolrCores(array &$warnings): array
+    {
+        // EXT:solr is optional, its classes are only loaded once this runs
+        $siteRepository = GeneralUtility::makeInstance(SolrSiteRepository::class);
+        $connectionManager = GeneralUtility::makeInstance(ConnectionManager::class);
+
+        $cores = [];
+        $servers = [];
+        $deadServers = [];
+        foreach ($siteRepository->getAvailableSites() as $site) {
+            foreach ($connectionManager->getConnectionsBySite($site) as $languageId => $connection) {
+                $endpoint = $connection->getEndpoint('read');
+                $server = $endpoint->getHost() . ':' . $endpoint->getPort();
+                $coreName = (string) $endpoint->getCore();
+                if (isset($cores[$server . '/' . $coreName])) {
+                    continue;
+                }
+
+                $core = [
+                    'core' => $coreName,
+                    'language' => $this->languageCode($site, (int) $languageId),
+                    'reachable' => false,
+                    'pingMs' => null,
+                    'documents' => null,
+                ];
+
+                if (!isset($deadServers[$server])) {
+                    try {
+                        $core['pingMs'] = round($connection->getReadService()->getPingRoundTripRuntime(false), 1);
+                        $core['reachable'] = true;
+                        $core['documents'] = $this->countSolrDocuments($connection);
+                        if (!array_key_exists($server, $servers)) {
+                            $servers[$server] = $this->readSolrServer($connection);
+                        }
+                    } catch (\Throwable $e) {
+                        if ($e->getCode() === self::SOLR_PING_NO_RESPONSE) {
+                            $deadServers[$server] = true;
+                        }
+                        $this->logger->warning('Health check: Solr core not reachable', ['core' => $coreName, 'exception' => $e]);
+                    }
+                }
+
+                if (!$core['reachable']) {
+                    $warnings[] = sprintf('Solr core %s not reachable', $coreName);
+                }
+                $cores[$server . '/' . $coreName] = $core;
+            }
+        }
+
+        foreach ($servers as $info) {
+            if (($info['heapRatio'] ?? 0) >= self::WARN_SOLR_HEAP_RATIO) {
+                $warnings[] = sprintf('Solr heap at %d%%', (int) ($info['heapRatio'] * 100));
+            }
+        }
+
+        return [array_values($cores), array_values(array_filter($servers))];
+    }
+
+    /**
+     * Documents in the core, a rows=0 query is cheaper than the luke handler.
+     */
+    private function countSolrDocuments(SolrConnection $connection): int
+    {
+        $client = $connection->getReadService()->getClient();
+        $query = $client->createSelect()->setQuery('*:*')->setRows(0);
+        return $client->select($query)->getNumFound();
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function readSolrServer(SolrConnection $connection): ?array
+    {
+        try {
+            $system = $connection->getAdminService()->getSystemInformation();
+        } catch (\Throwable $e) {
+            $this->logger->warning('Health check: Solr system info not readable', ['exception' => $e]);
+            return null;
+        }
+
+        // Property names contain dashes, so the response objects are read as arrays.
+        $lucene = (array) ($system->lucene ?? []);
+        $heap = (array) ($system->jvm->memory->raw ?? []);
+        $used = (int) ($heap['used'] ?? 0);
+        $max = (int) ($heap['max'] ?? 0);
+
+        return [
+            'version' => (string) ($lucene['solr-spec-version'] ?? ''),
+            'heapUsedBytes' => $used,
+            'heapMaxBytes' => $max,
+            'heapRatio' => $max > 0 ? round($used / $max, 3) : null,
+        ];
+    }
+
+    /**
+     * Same criteria as the EXT:solr queue statistics, read without its internal API.
+     *
+     * @param list<string> $warnings
+     * @return array<string, int|null>
+     */
+    private function collectSolrIndexQueue(array &$warnings): array
+    {
+        $queryBuilder = $this->connectionPool->getQueryBuilderForTable('tx_solr_indexqueue_item');
+        $row = $queryBuilder
+            ->selectLiteral(
+                'COUNT(*) AS total',
+                "SUM(CASE WHEN errors <> '' THEN 1 ELSE 0 END) AS failed",
+                "SUM(CASE WHEN errors = '' AND changed > indexed THEN 1 ELSE 0 END) AS pending",
+                "MIN(CASE WHEN errors = '' AND changed > indexed THEN changed END) AS oldest_pending"
+            )
+            ->from('tx_solr_indexqueue_item')
+            ->executeQuery()
+            ->fetchAssociative();
+
+        $oldestPending = (int) ($row['oldest_pending'] ?? 0);
+        $oldestPendingAge = $oldestPending > 0 ? max(0, time() - $oldestPending) : null;
+        if ($oldestPendingAge !== null && $oldestPendingAge > self::WARN_SOLR_QUEUE_STALLED_SECONDS) {
+            $warnings[] = sprintf('Solr index queue stalled for %d minutes', intdiv($oldestPendingAge, 60));
+        }
+
+        return [
+            'total' => (int) ($row['total'] ?? 0),
+            'pending' => (int) ($row['pending'] ?? 0),
+            'failed' => (int) ($row['failed'] ?? 0),
+            'oldestPendingSeconds' => $oldestPendingAge,
+        ];
+    }
+
+    private function languageCode(SolrSite $site, int $languageId): string
+    {
+        try {
+            return $site->getTypo3SiteObject()->getLanguageById($languageId)->getLocale()->getLanguageCode();
+        } catch (\Throwable) {
+            return (string) $languageId;
+        }
+    }
+
+    /**
      * Command identifier or short class name, read without unserializing the task.
      */
     private function taskName(string $serializedTask): string
@@ -425,6 +625,21 @@ class HealthMiddleware implements MiddlewareInterface
             'freeBytes' => (int) $free,
             'usedRatio' => round(1 - $free / $total, 3),
         ];
+    }
+
+    /**
+     * Prometheus drops the body of non-2xx responses, so errors are reported
+     * via `typo3_health_status` instead of the HTTP status.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function prometheus(array $payload): ResponseInterface
+    {
+        $response = new Response();
+        $response->getBody()->write((new PrometheusFormatter())->format($payload));
+        return $response
+            ->withHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+            ->withHeader('Cache-Control', 'no-store');
     }
 
     private function json(array $payload, int $status = 200): ResponseInterface
