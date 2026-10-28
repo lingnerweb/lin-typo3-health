@@ -127,12 +127,24 @@ class PrometheusFormatter
         $this->metric('database_latency_seconds', 'gauge', 'Time for connecting and reading the status variables.', [
             [[], $database['latencyMs'] / 1000],
         ]);
-        $this->metric('database_max_connections', 'gauge', 'Configured max_connections.', [
-            [[], $database['maxConnections']],
-        ]);
+        if ($database['maxConnections'] !== null) {
+            $this->metric('database_max_connections', 'gauge', 'Configured max_connections.', [
+                [[], $database['maxConnections']],
+            ]);
+        }
+        if ($database['maxUserConnections'] !== null) {
+            $this->metric('database_max_user_connections', 'gauge', 'Connection limit of the database account, 0 is unlimited.', [
+                [[], $database['maxUserConnections']],
+            ]);
+        }
+        if ($database['userConnections'] !== null) {
+            $this->metric('database_user_connections', 'gauge', 'Open connections of the database account.', [
+                [[], $database['userConnections']],
+            ]);
+        }
         if ($database['connectionRatio'] !== null) {
-            $this->metric('database_connection_ratio', 'gauge', 'Open connections relative to max_connections.', [
-                [[], $database['connectionRatio']],
+            $this->metric('database_connection_ratio', 'gauge', 'Open connections relative to the limit, see the limit label.', [
+                [['limit' => (string) $database['connectionLimit']], $database['connectionRatio']],
             ]);
         }
 
@@ -168,6 +180,7 @@ class PrometheusFormatter
 
         $series = [
             'info' => [],
+            'interval' => [],
             'lastExecution' => [],
             'nextExecution' => [],
             'runningSince' => [],
@@ -177,6 +190,7 @@ class PrometheusFormatter
         foreach ($scheduler['tasks'] as $task) {
             $uid = ['uid' => (string) $task['uid']];
             $series['info'][] = [$uid + ['name' => $task['name'], 'description' => $task['description']], 1];
+            $series['interval'][] = [$uid, $task['intervalSeconds'] ?? 0];
             $series['lastExecution'][] = [$uid, $this->timestamp($task['lastExecution'])];
             $series['nextExecution'][] = [$uid, $this->timestamp($task['nextExecution'])];
             $series['runningSince'][] = [$uid, $this->timestamp($task['runningSince'])];
@@ -185,11 +199,12 @@ class PrometheusFormatter
         }
 
         $this->metric('scheduler_task_info', 'gauge', 'Enabled scheduler tasks, the value is always 1.', $series['info']);
+        $this->metric('scheduler_task_interval_seconds', 'gauge', 'Configured seconds between two runs, 0 for single-run tasks.', $series['interval']);
         $this->metric('scheduler_task_last_execution_timestamp_seconds', 'gauge', 'Start of the last execution, 0 if never.', $series['lastExecution']);
         $this->metric('scheduler_task_next_execution_timestamp_seconds', 'gauge', 'Next planned execution, 0 if none.', $series['nextExecution']);
         $this->metric('scheduler_task_running_since_timestamp_seconds', 'gauge', 'Start of the current execution, 0 if not running.', $series['runningSince']);
         $this->metric('scheduler_task_failed', 'gauge', 'Whether the last execution failed.', $series['failed']);
-        $this->metric('scheduler_task_overdue', 'gauge', 'Whether the task is more than an hour overdue.', $series['overdue']);
+        $this->metric('scheduler_task_overdue', 'gauge', 'Whether the task is overdue by more than 150 % of its interval.', $series['overdue']);
     }
 
     /**
