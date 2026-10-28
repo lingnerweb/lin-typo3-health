@@ -2,13 +2,13 @@
 
 $EM_CONF[$_EXTKEY] = [
     'title' => 'TYPO3 Health',
-    'description' => 'Bearer-protected health endpoint (/_api/health) with database, PHP-FPM, scheduler and system metrics',
+    'description' => 'Bearer-protected health endpoint (/_api/health) with system metrics',
     'category' => 'misc',
-    'author' => 'LINGNER Webteam',
-    'author_email' => 'webteam@lingner.com',
-    'author_company' => 'LINGNER.com',
+    'author' => 'Calvin Reibenspieß',
+    'author_email' => 'c.reibenspiess@lingner.com',
+    'author_company' => 'LINGNER.COM',
     'state' => 'beta',
-    'version' => '0.1.0',
+    'version' => '1.0.0',
     'constraints' => [
         'depends' => [
             'typo3' => '12.4.0-12.4.99',
