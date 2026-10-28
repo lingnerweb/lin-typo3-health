@@ -336,7 +336,7 @@ class HealthMiddleware implements MiddlewareInterface
                 ->fetchOne();
             $rows = $this->connectionPool->getConnectionForTable('tx_scheduler_task')
                 ->select(
-                    ['uid', 'description', 'nextexecution', 'lastexecution_time', 'lastexecution_failure', 'serialized_executions', 'serialized_task_object'],
+                    ['*'],
                     'tx_scheduler_task',
                     ['deleted' => 0, 'disable' => 0],
                     [],
@@ -358,11 +358,10 @@ class HealthMiddleware implements MiddlewareInterface
             $runningSince = is_array($executions) && $executions !== [] ? (int) min($executions) : null;
             $failed = trim((string) $row['lastexecution_failure']) !== '';
             $nextExecution = (int) $row['nextexecution'];
-            $serializedTask = (string) $row['serialized_task_object'];
-            $interval = $this->taskInterval($serializedTask, $nextExecution);
+            $interval = $this->taskInterval($this->taskSchedule($row), $nextExecution);
             $threshold = $interval !== null ? (int) ($interval * self::WARN_SCHEDULER_INTERVAL_RATIO) : null;
             $overdue = $threshold !== null && $runningSince === null && $nextExecution > 0 && $now - $nextExecution > $threshold;
-            $name = $this->taskName($serializedTask);
+            $name = $this->taskName($row);
 
             if ($failed) {
                 $warnings[] = sprintf('Task %d (%s) failed', $row['uid'], $name);
@@ -584,19 +583,52 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
-     * Seconds between two runs, read from the serialized Execution without
-     * unserializing the task. Null for single-run tasks.
+     * Interval and cron expression of a task. TYPO3 v14 stores them as JSON in
+     * `execution_details`; v12/v13 and rows the v14 upgrade wizard has not
+     * migrated yet only in the serialized task, which is read without
+     * unserializing it.
+     *
+     * @param array<string, mixed> $row
+     * @return array{interval: int, cronCmd: string}|null
      */
-    private function taskInterval(string $serializedTask, int $nextExecution): ?int
+    private function taskSchedule(array $row): ?array
     {
+        $details = json_decode((string) ($row['execution_details'] ?? ''), true);
+        if (is_array($details)) {
+            return [
+                'interval' => (int) ($details['interval'] ?? 0),
+                'cronCmd' => (string) ($details['cronCmd'] ?? ''),
+            ];
+        }
+
         // Only the Execution object, tasks may have own properties of the same name
-        if (!preg_match('/Scheduler\\\\Execution":\d+:\{(.*?)\}/s', $serializedTask, $execution)) {
+        if (!preg_match('/Scheduler\\\\Execution":\d+:\{(.*?)\}/s', (string) ($row['serialized_task_object'] ?? ''), $execution)) {
             return null;
         }
-        $serializedExecution = $execution[1];
-
         // Protected properties are serialized as "\0*\0name"
-        if (preg_match('/\x00\*\x00cronCmd";s:\d+:"([^"]+)"/', $serializedExecution, $matches)) {
+        $cronCmd = preg_match('/\x00\*\x00cronCmd";s:\d+:"([^"]*)"/', $execution[1], $matches) ? $matches[1] : '';
+        $interval = preg_match('/\x00\*\x00interval";(?:i:(\d+)|s:\d+:"(\d+)")/', $execution[1], $matches)
+            ? (int) ($matches[1] ?: ($matches[2] ?? 0))
+            : 0;
+        return [
+            'interval' => $interval,
+            'cronCmd' => $cronCmd,
+        ];
+    }
+
+    /**
+     * Seconds between two runs, null for single-run tasks.
+     *
+     * @param array{interval: int, cronCmd: string}|null $schedule
+     */
+    private function taskInterval(?array $schedule, int $nextExecution): ?int
+    {
+        if ($schedule === null) {
+            return null;
+        }
+
+        $cronCmd = trim($schedule['cronCmd']);
+        if ($cronCmd !== '') {
             if ($nextExecution === 0) {
                 return null;
             }
@@ -604,10 +636,10 @@ class HealthMiddleware implements MiddlewareInterface
             // have different gaps. Counted from the run after the stored next execution,
             // which may come from a CLI with a different timezone.
             try {
-                $run = $this->nextCronRun($matches[1], $nextExecution);
+                $run = $this->nextCronRun($cronCmd, $nextExecution);
                 $gaps = [];
                 for ($i = 0; $i < 8; $i++) {
-                    $following = $this->nextCronRun($matches[1], $run);
+                    $following = $this->nextCronRun($cronCmd, $run);
                     $gaps[] = $following - $run;
                     $run = $following;
                 }
@@ -616,11 +648,7 @@ class HealthMiddleware implements MiddlewareInterface
                 return null;
             }
         }
-        if (preg_match('/\x00\*\x00interval";(?:i:(\d+)|s:\d+:"(\d+)")/', $serializedExecution, $matches)) {
-            $interval = (int) ($matches[1] ?: ($matches[2] ?? 0));
-            return $interval > 0 ? $interval : null;
-        }
-        return null;
+        return $schedule['interval'] > 0 ? $schedule['interval'] : null;
     }
 
     private function nextCronRun(string $cronCmd, int $after): int
@@ -631,10 +659,19 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
-     * Command identifier or short class name, read without unserializing the task.
+     * Command identifier or short class name. TYPO3 v14 stores it in `tasktype`,
+     * v12/v13 only in the serialized task, which is read without unserializing it.
+     *
+     * @param array<string, mixed> $row
      */
-    private function taskName(string $serializedTask): string
+    private function taskName(array $row): string
     {
+        $taskType = (string) ($row['tasktype'] ?? '');
+        if ($taskType !== '') {
+            return str_contains($taskType, '\\') ? substr(strrchr($taskType, '\\'), 1) : $taskType;
+        }
+
+        $serializedTask = (string) ($row['serialized_task_object'] ?? '');
         if (preg_match('/commandIdentifier";s:\d+:"([^"]+)"/', $serializedTask, $matches)) {
             return $matches[1];
         }

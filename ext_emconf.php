@@ -8,11 +8,11 @@ $EM_CONF[$_EXTKEY] = [
     'author_email' => 'c.reibenspiess@lingner.com',
     'author_company' => 'LINGNER.COM',
     'state' => 'beta',
-    'version' => '1.0.1',
+    'version' => '1.0.2',
     'constraints' => [
         'depends' => [
-            'typo3' => '12.4.0-12.4.99',
-            'scheduler' => '12.4.0-12.4.99',
+            'typo3' => '12.4.0-14.3.99',
+            'scheduler' => '12.4.0-14.3.99',
         ],
         'conflicts' => [],
         'suggests' => [],
