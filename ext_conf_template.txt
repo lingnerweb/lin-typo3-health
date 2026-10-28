@@ -1,0 +1,5 @@
+# cat=basic; type=string; label=Bearer token: Only used without the environment variable TYPO3_HEALTH_ENDPOINT_BEARER. Long and random, e.g. openssl rand -hex 32. Empty disables the endpoint.
+token =
+
+# cat=basic; type=boolean; label=System warnings: Warn on load, memory and disk usage. Disable on shared hosting, where these values describe the whole server.
+systemWarnings = 1

@@ -14,17 +14,24 @@ use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use Psr\Log\LoggerInterface;
+use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
+use TYPO3\CMS\Core\Core\Environment;
+use TYPO3\CMS\Core\Database\Connection;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Http\JsonResponse;
 use TYPO3\CMS\Core\Http\Response;
 use TYPO3\CMS\Core\Information\Typo3Version;
 use TYPO3\CMS\Core\Utility\ExtensionManagementUtility;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
+use TYPO3\CMS\Scheduler\CronCommand\CronCommand;
 
 /**
  * GET /_api/health: database, PHP-FPM, scheduler, Solr and system metrics for monitoring.
  *
- * - Bearer token via `Authorization` or `X-Authorization`; disabled without token.
+ * - Token from the environment or the extension configuration, sent as bearer
+ *   via `Authorization` or `X-Authorization`; disabled without token.
+ * - Works on shared hosting (FastCGI, open_basedir, disable_functions):
+ *   values that cannot be read are null.
  * - 200 for ok/degraded, 503 if the database is unreachable.
  * - `?format=prometheus` returns the Prometheus text format, always with 200.
  * - Counters are cumulative since server start, graph their rate.
@@ -33,6 +40,8 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
 class HealthMiddleware implements MiddlewareInterface
 {
     private const PATH = '/_api/health';
+    private const EXTENSION_KEY = 'lin_typo3_health';
+    private const TOKEN_VARIABLE = 'TYPO3_HEALTH_ENDPOINT_BEARER';
 
     private const DB_STATUS_VARIABLES = [
         'Threads_connected',
@@ -52,9 +61,8 @@ class HealthMiddleware implements MiddlewareInterface
     private const WARN_DISK_RATIO = 0.9;
     private const WARN_LOAD_PER_CPU = 2.0;
     private const WARN_ROW_LOCK_WAITS = 5;
-    private const WARN_SCHEDULER_IDLE_SECONDS = 900;
-    private const WARN_TASK_OVERDUE_SECONDS = 3600;
-    private const WARN_TASK_RUNNING_SECONDS = 3600;
+    // Relative to the configured task interval: scheduler idle (shortest interval), task overdue, task running
+    private const WARN_SCHEDULER_INTERVAL_RATIO = 1.5;
     private const WARN_SOLR_HEAP_RATIO = 0.9;
     private const WARN_SOLR_QUEUE_STALLED_SECONDS = 3600;
 
@@ -64,6 +72,7 @@ class HealthMiddleware implements MiddlewareInterface
     public function __construct(
         private readonly ConnectionPool $connectionPool,
         private readonly LoggerInterface $logger,
+        private readonly ExtensionConfiguration $extensionConfiguration,
     ) {}
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
@@ -72,7 +81,7 @@ class HealthMiddleware implements MiddlewareInterface
             return $handler->handle($request);
         }
 
-        $expectedToken = (string) getenv('TYPO3_HEALTH_ENDPOINT_BEARER');
+        $expectedToken = $this->expectedToken($request);
         if ($expectedToken === '') {
             return $handler->handle($request);
         }
@@ -104,7 +113,7 @@ class HealthMiddleware implements MiddlewareInterface
         $payload = [
             'status' => $status,
             'warnings' => $warnings,
-            'hostname' => gethostname() ?: null,
+            'hostname' => function_exists('gethostname') ? (gethostname() ?: null) : null,
             'time' => gmdate('c'),
             'typo3' => [
                 'version' => (new Typo3Version())->getVersion(),
@@ -130,10 +139,40 @@ class HealthMiddleware implements MiddlewareInterface
         return $this->json($payload, $status === 'error' ? 503 : 200);
     }
 
+    /**
+     * Environment first, then the extension configuration. Behind mod_rewrite,
+     * CGI/FastCGI only see `SetEnv` variables with a `REDIRECT_` prefix.
+     */
+    private function expectedToken(ServerRequestInterface $request): string
+    {
+        $serverParams = $request->getServerParams();
+        foreach ([self::TOKEN_VARIABLE, 'REDIRECT_' . self::TOKEN_VARIABLE] as $name) {
+            $token = trim((string) (getenv($name) ?: ($serverParams[$name] ?? '')));
+            if ($token !== '') {
+                return $token;
+            }
+        }
+        return trim((string) $this->extensionSetting('token', ''));
+    }
+
+    private function extensionSetting(string $path, mixed $default): mixed
+    {
+        try {
+            return $this->extensionConfiguration->get(self::EXTENSION_KEY, $path);
+        } catch (\Throwable) {
+            return $default;
+        }
+    }
+
     private function isAuthorized(ServerRequestInterface $request, string $expectedToken): bool
     {
-        foreach (['Authorization', 'X-Authorization'] as $header) {
-            if (preg_match('/^Bearer\s+(.+)$/i', $request->getHeaderLine($header), $matches)
+        $credentials = [
+            $request->getHeaderLine('Authorization'),
+            $request->getHeaderLine('X-Authorization'),
+            (string) ($request->getServerParams()['REDIRECT_HTTP_AUTHORIZATION'] ?? ''),
+        ];
+        foreach ($credentials as $credential) {
+            if (preg_match('/^Bearer\s+(.+)$/i', $credential, $matches)
                 && hash_equals($expectedToken, trim($matches[1]))) {
                 return true;
             }
@@ -142,6 +181,13 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
+     * MySQL or MariaDB. Only `SELECT 1` decides about reachability, shared
+     * database servers may deny the other queries.
+     *
+     * With a per-account `max_user_connections` (the session value carries
+     * the account limit) the ratio refers to the own connections, otherwise
+     * to `Threads_connected` of the whole server.
+     *
      * @param list<string> $warnings
      * @return array<string, mixed>
      */
@@ -151,13 +197,7 @@ class HealthMiddleware implements MiddlewareInterface
 
         try {
             $connection = $this->connectionPool->getConnectionByName(ConnectionPool::DEFAULT_CONNECTION_NAME);
-            $maxConnections = (int) $connection->executeQuery('SELECT @@max_connections')->fetchOne();
-
-            $placeholders = implode(',', array_fill(0, count(self::DB_STATUS_VARIABLES), '?'));
-            $rows = $connection->executeQuery(
-                'SHOW GLOBAL STATUS WHERE Variable_name IN (' . $placeholders . ')',
-                self::DB_STATUS_VARIABLES
-            )->fetchAllAssociative();
+            $connection->executeQuery('SELECT 1')->fetchOne();
         } catch (\Throwable $e) {
             // Message may contain credentials, log only
             $this->logger->error('Health check: database not reachable', ['exception' => $e]);
@@ -166,17 +206,24 @@ class HealthMiddleware implements MiddlewareInterface
                 'reachable' => false,
             ];
         }
+        $latencyMs = round((microtime(true) - $startedAt) * 1000, 1);
 
-        $status = [];
-        foreach ($rows as $row) {
-            $status[(string) $row['Variable_name']] = (int) $row['Value'];
-        }
+        $status = $this->readDatabaseStatus($connection);
+        $maxConnections = $this->queryDatabase('max_connections', static fn(): int => (int) $connection->executeQuery('SELECT @@max_connections')->fetchOne());
+        $maxUserConnections = $this->queryDatabase('max_user_connections', static fn(): int => (int) $connection->executeQuery('SELECT @@max_user_connections')->fetchOne());
+        // Without the PROCESS privilege the process list only contains the own threads anyway
+        $userConnections = $maxUserConnections > 0 ? $this->queryDatabase('user connections', static fn(): int => (int) $connection->executeQuery(
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = SUBSTRING_INDEX(CURRENT_USER(), '@', 1)"
+        )->fetchOne()) : null;
 
-        $threadsConnected = $status['Threads_connected'] ?? 0;
-        $connectionRatio = $maxConnections > 0 ? round($threadsConnected / $maxConnections, 3) : null;
+        [$connectionLimit, $connectionRatio] = match (true) {
+            $userConnections !== null => ['max_user_connections', round($userConnections / $maxUserConnections, 3)],
+            $maxConnections > 0 && isset($status['Threads_connected']) => ['max_connections', round($status['Threads_connected'] / $maxConnections, 3)],
+            default => [null, null],
+        };
 
         if ($connectionRatio !== null && $connectionRatio >= self::WARN_CONNECTION_RATIO) {
-            $warnings[] = sprintf('Database connections at %d%% of max_connections', (int) ($connectionRatio * 100));
+            $warnings[] = sprintf('Database connections at %d%% of %s', (int) ($connectionRatio * 100), $connectionLimit);
         }
         if (($status['Innodb_row_lock_current_waits'] ?? 0) >= self::WARN_ROW_LOCK_WAITS) {
             $warnings[] = sprintf('%d InnoDB row lock waits pending', $status['Innodb_row_lock_current_waits']);
@@ -184,11 +231,49 @@ class HealthMiddleware implements MiddlewareInterface
 
         return [
             'reachable' => true,
-            'latencyMs' => round((microtime(true) - $startedAt) * 1000, 1),
+            'latencyMs' => $latencyMs,
             'maxConnections' => $maxConnections,
+            'maxUserConnections' => $maxUserConnections,
+            'userConnections' => $userConnections,
+            'connectionLimit' => $connectionLimit,
             'connectionRatio' => $connectionRatio,
             'status' => $status,
         ];
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    private function readDatabaseStatus(Connection $connection): array
+    {
+        $placeholders = implode(',', array_fill(0, count(self::DB_STATUS_VARIABLES), '?'));
+        $rows = $this->queryDatabase('status variables', static fn(): array => $connection->executeQuery(
+            'SHOW GLOBAL STATUS WHERE Variable_name IN (' . $placeholders . ')',
+            self::DB_STATUS_VARIABLES
+        )->fetchAllAssociative()) ?? [];
+
+        $status = [];
+        foreach ($rows as $row) {
+            $status[(string) $row['Variable_name']] = (int) $row['Value'];
+        }
+        return $status;
+    }
+
+    /**
+     * Runs a query that may be denied, null on failure.
+     *
+     * @template T
+     * @param callable(): T $query
+     * @return T|null
+     */
+    private function queryDatabase(string $label, callable $query): mixed
+    {
+        try {
+            return $query();
+        } catch (\Throwable $e) {
+            $this->logger->warning('Health check: database ' . $label . ' not readable', ['exception' => $e]);
+            return null;
+        }
     }
 
     /**
@@ -234,6 +319,12 @@ class HealthMiddleware implements MiddlewareInterface
      * Last cron run and state of all enabled tasks. Failure messages are
      * omitted, they may contain paths.
      *
+     * Thresholds follow the configured task intervals, so an hourly cron on
+     * shared hosting only warns when a task is configured more often than
+     * that: the scheduler is idle after 150 % of the shortest interval, a
+     * task is overdue or running too long after 150 % of its own interval.
+     * Single-run tasks have no interval and are not checked.
+     *
      * @param list<string> $warnings
      * @return array<string, mixed>|null
      */
@@ -261,23 +352,22 @@ class HealthMiddleware implements MiddlewareInterface
         $lastRun = is_string($lastRunValue) ? unserialize($lastRunValue, ['allowed_classes' => false]) : null;
         $lastRunEnd = is_array($lastRun) ? (int) ($lastRun['end'] ?? 0) : 0;
 
-        if ($lastRunEnd === 0 || $now - $lastRunEnd > self::WARN_SCHEDULER_IDLE_SECONDS) {
-            $warnings[] = 'Scheduler has not run for more than ' . (self::WARN_SCHEDULER_IDLE_SECONDS / 60) . ' minutes';
-        }
-
         $tasks = [];
         foreach ($rows as $row) {
             $executions = $row['serialized_executions'] ? unserialize((string) $row['serialized_executions'], ['allowed_classes' => false]) : [];
             $runningSince = is_array($executions) && $executions !== [] ? (int) min($executions) : null;
             $failed = trim((string) $row['lastexecution_failure']) !== '';
             $nextExecution = (int) $row['nextexecution'];
-            $overdue = $runningSince === null && $nextExecution > 0 && $now - $nextExecution > self::WARN_TASK_OVERDUE_SECONDS;
-            $name = $this->taskName((string) $row['serialized_task_object']);
+            $serializedTask = (string) $row['serialized_task_object'];
+            $interval = $this->taskInterval($serializedTask, $nextExecution);
+            $threshold = $interval !== null ? (int) ($interval * self::WARN_SCHEDULER_INTERVAL_RATIO) : null;
+            $overdue = $threshold !== null && $runningSince === null && $nextExecution > 0 && $now - $nextExecution > $threshold;
+            $name = $this->taskName($serializedTask);
 
             if ($failed) {
                 $warnings[] = sprintf('Task %d (%s) failed', $row['uid'], $name);
             }
-            if ($runningSince !== null && $now - $runningSince > self::WARN_TASK_RUNNING_SECONDS) {
+            if ($threshold !== null && $runningSince !== null && $now - $runningSince > $threshold) {
                 $warnings[] = sprintf('Task %d (%s) running for %d minutes', $row['uid'], $name, intdiv($now - $runningSince, 60));
             }
 
@@ -285,12 +375,27 @@ class HealthMiddleware implements MiddlewareInterface
                 'uid' => (int) $row['uid'],
                 'name' => $name,
                 'description' => (string) $row['description'],
+                'intervalSeconds' => $interval,
                 'lastExecution' => $row['lastexecution_time'] ? gmdate('c', (int) $row['lastexecution_time']) : null,
                 'nextExecution' => $nextExecution ? gmdate('c', $nextExecution) : null,
                 'runningSince' => $runningSince ? gmdate('c', $runningSince) : null,
                 'failed' => $failed,
                 'overdue' => $overdue,
             ];
+        }
+
+        $intervals = array_filter(array_column($tasks, 'intervalSeconds'));
+        if ($intervals !== []) {
+            $shortestInterval = min($intervals);
+            if ($lastRunEnd === 0) {
+                $warnings[] = 'Scheduler has never run';
+            } elseif ($now - $lastRunEnd > $shortestInterval * self::WARN_SCHEDULER_INTERVAL_RATIO) {
+                $warnings[] = sprintf(
+                    'Scheduler has not run for %d minutes, shortest task interval is %d minutes',
+                    intdiv($now - $lastRunEnd, 60),
+                    intdiv($shortestInterval, 60)
+                );
+            }
         }
 
         $overdueCount = count(array_filter($tasks, static fn(array $task): bool => $task['overdue']));
@@ -479,6 +584,53 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
+     * Seconds between two runs, read from the serialized Execution without
+     * unserializing the task. Null for single-run tasks.
+     */
+    private function taskInterval(string $serializedTask, int $nextExecution): ?int
+    {
+        // Only the Execution object, tasks may have own properties of the same name
+        if (!preg_match('/Scheduler\\\\Execution":\d+:\{(.*?)\}/s', $serializedTask, $execution)) {
+            return null;
+        }
+        $serializedExecution = $execution[1];
+
+        // Protected properties are serialized as "\0*\0name"
+        if (preg_match('/\x00\*\x00cronCmd";s:\d+:"([^"]+)"/', $serializedExecution, $matches)) {
+            if ($nextExecution === 0) {
+                return null;
+            }
+            // Shortest gap between the upcoming runs, irregular expressions (weekdays only)
+            // have different gaps. Counted from the run after the stored next execution,
+            // which may come from a CLI with a different timezone.
+            try {
+                $run = $this->nextCronRun($matches[1], $nextExecution);
+                $gaps = [];
+                for ($i = 0; $i < 8; $i++) {
+                    $following = $this->nextCronRun($matches[1], $run);
+                    $gaps[] = $following - $run;
+                    $run = $following;
+                }
+                return max(60, min($gaps));
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+        if (preg_match('/\x00\*\x00interval";(?:i:(\d+)|s:\d+:"(\d+)")/', $serializedExecution, $matches)) {
+            $interval = (int) ($matches[1] ?: ($matches[2] ?? 0));
+            return $interval > 0 ? $interval : null;
+        }
+        return null;
+    }
+
+    private function nextCronRun(string $cronCmd, int $after): int
+    {
+        $cronCommand = new CronCommand($cronCmd, $after);
+        $cronCommand->calculateNextValue();
+        return (int) $cronCommand->getTimestamp();
+    }
+
+    /**
      * Command identifier or short class name, read without unserializing the task.
      */
     private function taskName(string $serializedTask): string
@@ -493,11 +645,16 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
+     * On shared hosting these values describe the whole server, not the
+     * account, so the warnings can be disabled in the extension configuration.
+     *
      * @param list<string> $warnings
      * @return array<string, mixed>
      */
     private function collectSystem(array &$warnings): array
     {
+        $warn = (bool) $this->extensionSetting('systemWarnings', true);
+
         $cpuCount = $this->readCpuCount();
         $load = function_exists('sys_getloadavg') ? sys_getloadavg() : false;
         $loadAverage = $load === false ? null : [
@@ -506,18 +663,18 @@ class HealthMiddleware implements MiddlewareInterface
             '15m' => round($load[2], 2),
         ];
 
-        if ($loadAverage !== null && $cpuCount > 0 && $loadAverage['5m'] / $cpuCount >= self::WARN_LOAD_PER_CPU) {
+        if ($warn && $loadAverage !== null && $cpuCount > 0 && $loadAverage['5m'] / $cpuCount >= self::WARN_LOAD_PER_CPU) {
             $warnings[] = sprintf('Load average %.2f on %d CPUs', $loadAverage['5m'], $cpuCount);
         }
 
         $memory = $this->readMemory();
-        if (($memory['usedRatio'] ?? 0) >= self::WARN_MEMORY_RATIO) {
+        if ($warn && ($memory['usedRatio'] ?? 0) >= self::WARN_MEMORY_RATIO) {
             $warnings[] = sprintf('Memory usage at %d%%', (int) ($memory['usedRatio'] * 100));
         }
 
         $disks = $this->readDisks();
         foreach ($disks as $name => $disk) {
-            if ($disk['usedRatio'] >= self::WARN_DISK_RATIO) {
+            if ($warn && $disk['usedRatio'] >= self::WARN_DISK_RATIO) {
                 $warnings[] = sprintf('Disk "%s" at %d%%', $name, (int) ($disk['usedRatio'] * 100));
             }
         }
@@ -540,6 +697,9 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
+     * Without MemAvailable (old kernels, OpenVZ/Virtuozzo containers) it is
+     * approximated by free memory plus buffers and page cache.
+     *
      * @return array<string, int|float>|null
      */
     private function readMemory(): ?array
@@ -556,14 +716,18 @@ class HealthMiddleware implements MiddlewareInterface
         );
 
         $total = $values['MemTotal'] ?? 0;
-        $available = $values['MemAvailable'] ?? 0;
+        $available = $values['MemAvailable']
+            ?? (isset($values['MemFree']) ? $values['MemFree'] + ($values['Buffers'] ?? 0) + ($values['Cached'] ?? 0) : null);
+        if ($total <= 0 || $available === null) {
+            return null;
+        }
         $swapTotal = $values['SwapTotal'] ?? 0;
         $swapFree = $values['SwapFree'] ?? 0;
 
         return [
             'totalBytes' => $total,
             'availableBytes' => $available,
-            'usedRatio' => $total > 0 ? round(1 - $available / $total, 3) : 0,
+            'usedRatio' => round(max(0, 1 - $available / $total), 3),
             'swapTotalBytes' => $swapTotal,
             'swapUsedBytes' => $swapTotal - $swapFree,
             'swapUsedRatio' => $swapTotal > 0 ? round(1 - $swapFree / $swapTotal, 3) : 0,
@@ -572,16 +736,14 @@ class HealthMiddleware implements MiddlewareInterface
 
     /**
      * All block devices from /proc/mounts, keyed by device name. Mount points
-     * are not returned.
+     * are not returned. If none is readable (open_basedir), the volume of the
+     * project is reported as "project".
      *
      * @return array<string, array<string, mixed>>
      */
     private function readDisks(): array
     {
-        $mounts = @file('/proc/mounts', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        if ($mounts === false) {
-            return [];
-        }
+        $mounts = @file('/proc/mounts', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
 
         // device => shortest mount point
         $devices = [];
@@ -606,6 +768,13 @@ class HealthMiddleware implements MiddlewareInterface
                 $disks[$name] = $disk;
             }
         }
+
+        if ($disks === []) {
+            $disk = $this->readDisk(Environment::getProjectPath());
+            if ($disk !== null) {
+                $disks['project'] = $disk;
+            }
+        }
         return $disks;
     }
 
@@ -614,6 +783,9 @@ class HealthMiddleware implements MiddlewareInterface
      */
     private function readDisk(string $path): ?array
     {
+        if (!function_exists('disk_total_space') || !function_exists('disk_free_space')) {
+            return null;
+        }
         $total = @disk_total_space($path);
         $free = @disk_free_space($path);
         if ($total === false || $free === false || $total <= 0) {
