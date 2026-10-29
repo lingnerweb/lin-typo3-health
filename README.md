@@ -73,6 +73,29 @@ Both formats carry the same data. Counters (`Slow_queries`, `Connection_errors_m
 
 Default format. Top-level keys: `status`, `warnings`, `hostname`, `time`, `typo3`, `php`, `database`, `fpm`, `scheduler`, `solr`, `system`, `durationMs`. Sections that are not available (no PHP-FPM, no EXT:solr, database down) are `null`.
 
+Each warning is an object with `key` and `message`. The key follows the message as `<area>.<condition>[.<subject>]` and stays the same while the warning lasts, the message carries the current values:
+
+| Key | Message |
+|---|---|
+| `database.not_reachable` | Database not reachable |
+| `database.connections_high` | Database connections at 85% of max_user_connections |
+| `database.row_lock_waits_pending` | 7 InnoDB row lock waits pending |
+| `fpm.requests_waiting` | 3 requests waiting for a PHP-FPM worker |
+| `scheduler.never_run` | Scheduler has never run |
+| `scheduler.not_running` | Scheduler has not run for 42 minutes, shortest task interval is 5 minutes |
+| `scheduler.tasks_overdue` | 2 scheduler tasks overdue |
+| `scheduler.task_failed.<uid>` | Task 12 (IndexQueueWorkerTask) failed |
+| `scheduler.task_running_long.<uid>` | Task 12 (IndexQueueWorkerTask) running for 95 minutes |
+| `solr.status_not_readable` | Solr status not readable |
+| `solr.core_not_reachable.<host:port>/<core>` | Solr core core_de not reachable |
+| `solr.heap_high.<host:port>` | Solr heap at 93% |
+| `solr.index_queue_stalled` | Solr index queue stalled for 75 minutes |
+| `system.load_high` | Load average 9.12 on 4 CPUs |
+| `system.memory_high` | Memory usage at 91% |
+| `system.disk_high.<name>` | Disk "project" at 92% |
+
+Use the key to follow a warning across checks.
+
 - `200` with `status` `ok` or `degraded`
 - `503` with `status` `error`
 
@@ -86,7 +109,7 @@ Text exposition format, metrics prefixed with `typo3_health_`. Always `200`: Pro
 
 - `typo3_health_status`: 0 ok, 1 degraded, 2 error
 - `typo3_health_database_up`
-- `typo3_health_warning{message="…"}`: one series per active warning
+- `typo3_health_warning{key="…", message="…"}`: one series per active warning. The message changes with its values, so group and alert by `key`, e.g. `max without (message) (typo3_health_warning)`
 - `typo3_health_info{typo3_version, php_version, …}`: versions as labels
 - `typo3_health_scheduler_task_*{uid="…"}`: one series per task, including `typo3_health_scheduler_task_interval_seconds`
 - `typo3_health_database_connection_ratio{limit="…"}`: `max_user_connections` or `max_connections`
