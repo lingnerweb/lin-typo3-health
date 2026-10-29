@@ -164,6 +164,17 @@ class HealthMiddleware implements MiddlewareInterface
         }
     }
 
+    /**
+     * The key stays the same while the message carries the current values,
+     * so consumers can follow one warning across checks.
+     *
+     * @return array{key: string, message: string}
+     */
+    private function warning(string $key, string $message): array
+    {
+        return ['key' => $key, 'message' => $message];
+    }
+
     private function isAuthorized(ServerRequestInterface $request, string $expectedToken): bool
     {
         $credentials = [
@@ -188,7 +199,7 @@ class HealthMiddleware implements MiddlewareInterface
      * the account limit) the ratio refers to the own connections, otherwise
      * to `Threads_connected` of the whole server.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array<string, mixed>
      */
     private function collectDatabase(array &$warnings): array
@@ -201,7 +212,7 @@ class HealthMiddleware implements MiddlewareInterface
         } catch (\Throwable $e) {
             // Message may contain credentials, log only
             $this->logger->error('Health check: database not reachable', ['exception' => $e]);
-            $warnings[] = 'Database not reachable';
+            $warnings[] = $this->warning('database.not_reachable', 'Database not reachable');
             return [
                 'reachable' => false,
             ];
@@ -223,10 +234,10 @@ class HealthMiddleware implements MiddlewareInterface
         };
 
         if ($connectionRatio !== null && $connectionRatio >= self::WARN_CONNECTION_RATIO) {
-            $warnings[] = sprintf('Database connections at %d%% of %s', (int) ($connectionRatio * 100), $connectionLimit);
+            $warnings[] = $this->warning('database.connections_high', sprintf('Database connections at %d%% of %s', (int) ($connectionRatio * 100), $connectionLimit));
         }
         if (($status['Innodb_row_lock_current_waits'] ?? 0) >= self::WARN_ROW_LOCK_WAITS) {
-            $warnings[] = sprintf('%d InnoDB row lock waits pending', $status['Innodb_row_lock_current_waits']);
+            $warnings[] = $this->warning('database.row_lock_waits_pending', sprintf('%d InnoDB row lock waits pending', $status['Innodb_row_lock_current_waits']));
         }
 
         return [
@@ -279,7 +290,7 @@ class HealthMiddleware implements MiddlewareInterface
     /**
      * Listen queue > 0 means all workers are busy.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array<string, int|string>|null
      */
     private function collectFpm(array &$warnings): ?array
@@ -309,7 +320,7 @@ class HealthMiddleware implements MiddlewareInterface
         ];
 
         if ($fpm['listenQueue'] > 0) {
-            $warnings[] = sprintf('%d requests waiting for a PHP-FPM worker', $fpm['listenQueue']);
+            $warnings[] = $this->warning('fpm.requests_waiting', sprintf('%d requests waiting for a PHP-FPM worker', $fpm['listenQueue']));
         }
 
         return $fpm;
@@ -325,7 +336,7 @@ class HealthMiddleware implements MiddlewareInterface
      * task is overdue or running too long after 150 % of its own interval.
      * Single-run tasks have no interval and are not checked.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array<string, mixed>|null
      */
     private function collectScheduler(array &$warnings): ?array
@@ -364,10 +375,10 @@ class HealthMiddleware implements MiddlewareInterface
             $name = $this->taskName($row);
 
             if ($failed) {
-                $warnings[] = sprintf('Task %d (%s) failed', $row['uid'], $name);
+                $warnings[] = $this->warning('scheduler.task_failed.' . $row['uid'], sprintf('Task %d (%s) failed', $row['uid'], $name));
             }
             if ($threshold !== null && $runningSince !== null && $now - $runningSince > $threshold) {
-                $warnings[] = sprintf('Task %d (%s) running for %d minutes', $row['uid'], $name, intdiv($now - $runningSince, 60));
+                $warnings[] = $this->warning('scheduler.task_running_long.' . $row['uid'], sprintf('Task %d (%s) running for %d minutes', $row['uid'], $name, intdiv($now - $runningSince, 60)));
             }
 
             $tasks[] = [
@@ -387,19 +398,19 @@ class HealthMiddleware implements MiddlewareInterface
         if ($intervals !== []) {
             $shortestInterval = min($intervals);
             if ($lastRunEnd === 0) {
-                $warnings[] = 'Scheduler has never run';
+                $warnings[] = $this->warning('scheduler.never_run', 'Scheduler has never run');
             } elseif ($now - $lastRunEnd > $shortestInterval * self::WARN_SCHEDULER_INTERVAL_RATIO) {
-                $warnings[] = sprintf(
+                $warnings[] = $this->warning('scheduler.not_running', sprintf(
                     'Scheduler has not run for %d minutes, shortest task interval is %d minutes',
                     intdiv($now - $lastRunEnd, 60),
                     intdiv($shortestInterval, 60)
-                );
+                ));
             }
         }
 
         $overdueCount = count(array_filter($tasks, static fn(array $task): bool => $task['overdue']));
         if ($overdueCount > 0) {
-            $warnings[] = sprintf('%d scheduler tasks overdue', $overdueCount);
+            $warnings[] = $this->warning('scheduler.tasks_overdue', sprintf('%d scheduler tasks overdue', $overdueCount));
         }
 
         return [
@@ -413,7 +424,7 @@ class HealthMiddleware implements MiddlewareInterface
      * Cores of all sites, one server info per Solr server and the index queue.
      * Null without EXT:solr. Messages may contain hosts, so they are logged only.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array<string, mixed>|null
      */
     private function collectSolr(array &$warnings): ?array
@@ -427,7 +438,7 @@ class HealthMiddleware implements MiddlewareInterface
             $indexQueue = $this->collectSolrIndexQueue($warnings);
         } catch (\Throwable $e) {
             $this->logger->error('Health check: Solr status not readable', ['exception' => $e]);
-            $warnings[] = 'Solr status not readable';
+            $warnings[] = $this->warning('solr.status_not_readable', 'Solr status not readable');
             return null;
         }
 
@@ -442,7 +453,7 @@ class HealthMiddleware implements MiddlewareInterface
      * Once a server gives no HTTP response, its remaining cores are not pinged:
      * a dead server costs one connect timeout instead of one per core.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}
      */
     private function collectSolrCores(array &$warnings): array
@@ -488,15 +499,15 @@ class HealthMiddleware implements MiddlewareInterface
                 }
 
                 if (!$core['reachable']) {
-                    $warnings[] = sprintf('Solr core %s not reachable', $coreName);
+                    $warnings[] = $this->warning('solr.core_not_reachable.' . $server . '/' . $coreName, sprintf('Solr core %s not reachable', $coreName));
                 }
                 $cores[$server . '/' . $coreName] = $core;
             }
         }
 
-        foreach ($servers as $info) {
+        foreach ($servers as $server => $info) {
             if (($info['heapRatio'] ?? 0) >= self::WARN_SOLR_HEAP_RATIO) {
-                $warnings[] = sprintf('Solr heap at %d%%', (int) ($info['heapRatio'] * 100));
+                $warnings[] = $this->warning('solr.heap_high.' . $server, sprintf('Solr heap at %d%%', (int) ($info['heapRatio'] * 100)));
             }
         }
 
@@ -542,7 +553,7 @@ class HealthMiddleware implements MiddlewareInterface
     /**
      * Same criteria as the EXT:solr queue statistics, read without its internal API.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array<string, int|null>
      */
     private function collectSolrIndexQueue(array &$warnings): array
@@ -562,7 +573,7 @@ class HealthMiddleware implements MiddlewareInterface
         $oldestPending = (int) ($row['oldest_pending'] ?? 0);
         $oldestPendingAge = $oldestPending > 0 ? max(0, time() - $oldestPending) : null;
         if ($oldestPendingAge !== null && $oldestPendingAge > self::WARN_SOLR_QUEUE_STALLED_SECONDS) {
-            $warnings[] = sprintf('Solr index queue stalled for %d minutes', intdiv($oldestPendingAge, 60));
+            $warnings[] = $this->warning('solr.index_queue_stalled', sprintf('Solr index queue stalled for %d minutes', intdiv($oldestPendingAge, 60)));
         }
 
         return [
@@ -685,7 +696,7 @@ class HealthMiddleware implements MiddlewareInterface
      * On shared hosting these values describe the whole server, not the
      * account, so the warnings can be disabled in the extension configuration.
      *
-     * @param list<string> $warnings
+     * @param list<array{key: string, message: string}> $warnings
      * @return array<string, mixed>
      */
     private function collectSystem(array &$warnings): array
@@ -701,18 +712,18 @@ class HealthMiddleware implements MiddlewareInterface
         ];
 
         if ($warn && $loadAverage !== null && $cpuCount > 0 && $loadAverage['5m'] / $cpuCount >= self::WARN_LOAD_PER_CPU) {
-            $warnings[] = sprintf('Load average %.2f on %d CPUs', $loadAverage['5m'], $cpuCount);
+            $warnings[] = $this->warning('system.load_high', sprintf('Load average %.2f on %d CPUs', $loadAverage['5m'], $cpuCount));
         }
 
         $memory = $this->readMemory();
         if ($warn && ($memory['usedRatio'] ?? 0) >= self::WARN_MEMORY_RATIO) {
-            $warnings[] = sprintf('Memory usage at %d%%', (int) ($memory['usedRatio'] * 100));
+            $warnings[] = $this->warning('system.memory_high', sprintf('Memory usage at %d%%', (int) ($memory['usedRatio'] * 100)));
         }
 
         $disks = $this->readDisks();
         foreach ($disks as $name => $disk) {
             if ($warn && $disk['usedRatio'] >= self::WARN_DISK_RATIO) {
-                $warnings[] = sprintf('Disk "%s" at %d%%', $name, (int) ($disk['usedRatio'] * 100));
+                $warnings[] = $this->warning('system.disk_high.' . $name, sprintf('Disk "%s" at %d%%', $name, (int) ($disk['usedRatio'] * 100)));
             }
         }
 
