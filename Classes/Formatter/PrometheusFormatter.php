@@ -92,8 +92,8 @@ class PrometheusFormatter
         $this->metric(
             'warning',
             'gauge',
-            'One series per active warning, the message is the label.',
-            array_map(static fn(string $warning): array => [['message' => $warning], 1], $payload['warnings'])
+            'One series per active warning. The key identifies the warning, the message carries the current values.',
+            array_map(static fn(array $warning): array => [$warning, 1], $payload['warnings'])
         );
         $this->metric('info', 'gauge', 'Server information, the value is always 1.', [
             [[
