@@ -1,6 +1,6 @@
 # lin_typo3_health
 
-Monitoring endpoint for TYPO3: `GET /_api/health` reports system metrics, database, PHP-FPM, scheduler and Solr.
+Monitoring endpoint for TYPO3: `GET /_api/health` reports system metrics, database, PHP-FPM, scheduler, Solr and errors from the TYPO3 logs.
 
 ## Setup
 
@@ -71,7 +71,7 @@ Both formats carry the same data. Counters (`Slow_queries`, `Connection_errors_m
 
 ### JSON
 
-Default format. Top-level keys: `status`, `warnings`, `hostname`, `time`, `typo3`, `php`, `database`, `fpm`, `scheduler`, `solr`, `system`, `durationMs`. Sections that are not available (no PHP-FPM, no EXT:solr, database down) are `null`.
+Default format. Top-level keys: `status`, `warnings`, `hostname`, `time`, `typo3`, `php`, `database`, `fpm`, `scheduler`, `solr`, `sysLog`, `errorLog`, `system`, `durationMs`. Sections that are not available (no PHP-FPM, no EXT:solr, database down, no log file) are `null`.
 
 Each warning is an object with `key` and `message`. The key follows the message as `<area>.<condition>[.<subject>]` and stays the same while the warning lasts, the message carries the current values:
 
@@ -85,16 +85,16 @@ Each warning is an object with `key` and `message`. The key follows the message 
 | `scheduler.not_running` | Scheduler has not run for 42 minutes, shortest task interval is 5 minutes |
 | `scheduler.tasks_overdue` | 2 scheduler tasks overdue |
 | `scheduler.task_failed.<uid>` | Task 12 (IndexQueueWorkerTask) failed |
-| `scheduler.task_running_long.<uid>` | Task 12 (IndexQueueWorkerTask) running for 95 minutes |
+| `scheduler.task_running_long.<uid>` | Task 12 (IndexQueueWorkerTask) running for 95 minutes (1 hour 35 minutes) |
 | `solr.status_not_readable` | Solr status not readable |
-| `solr.core_not_reachable.<host:port>/<core>` | Solr core core_de not reachable |
-| `solr.heap_high.<host:port>` | Solr heap at 93% |
-| `solr.index_queue_stalled` | Solr index queue stalled for 75 minutes |
+| `solr.core_not_reachable.<core>` | Solr core core_de not reachable |
+| `solr.heap_high.<server>` | Solr heap at 93% |
+| `solr.index_queue_stalled` | Solr index queue stalled for 1344 minutes (22 hours 24 minutes) |
 | `system.load_high` | Load average 9.12 on 4 CPUs |
 | `system.memory_high` | Memory usage at 91% |
 | `system.disk_high.<name>` | Disk "project" at 92% |
 
-Use the key to follow a warning across checks.
+Use the key to follow a warning across checks. Keys and messages contain no hosts: Solr servers are numbered like the `server` label of the Prometheus metrics. Durations from one hour on are broken down into days, hours and minutes.
 
 - `200` with `status` `ok` or `degraded`
 - `503` with `status` `error`
@@ -113,6 +113,7 @@ Text exposition format, metrics prefixed with `typo3_health_`. Always `200`: Pro
 - `typo3_health_info{typo3_version, php_version, …}`: versions as labels
 - `typo3_health_scheduler_task_*{uid="…"}`: one series per task, including `typo3_health_scheduler_task_interval_seconds`
 - `typo3_health_database_connection_ratio{limit="…"}`: `max_user_connections` or `max_connections`
+- `typo3_health_sys_log_errors{type="user|system|security"}`, `typo3_health_log_entries{log, level}`, `typo3_health_log_error_pages{type="page|content"}`: counts of the last 24 hours, see [Logs](#logs)
 
 ## Extensions
 
@@ -122,8 +123,44 @@ Active when EXT:solr is installed, otherwise `solr` is `null` and no `typo3_heal
 
 - every core of every site: reachable, ping time, number of documents
 - per Solr server: version and JVM heap
-- the index queue: pending and failed items, age of the oldest pending item
+- the index queue of the configured Solr sites: pending and failed items, age of the oldest pending item
 
-Warnings: a core is not reachable, the heap is at 90 %, the oldest pending queue item is older than 60 minutes. Failed queue items are only counted, they tend to stay and would warn permanently.
+Warnings: a core is not reachable, the heap is at 90 %, the oldest pending queue item is older than 60 minutes. Failed queue items are only counted, they tend to stay and would warn permanently. Pending means what the index queue worker picks up: no error, changed after the last indexing, not scheduled for later. Items of sites that are no longer configured are not counted, the worker never indexes them.
 
 Once a Solr server gives no response at all, its remaining cores are not pinged, so a dead server costs one connect timeout (`HTTP.connect_timeout`) instead of one per core.
+
+## Logs
+
+Both are counted over the last 24 hours and raise no warning, alert on them in the monitoring.
+
+### Backend log (`sysLog`)
+
+Entries of `sys_log` (Backend → System → Log) with an error classification, by type: `user`, `system`, `security`. Counts only, the details contain IP addresses and record titles.
+
+### Log files (`errorLog`)
+
+Entries of level error and above in `var/log/typo3_*.log` (the default `FileWriter` files, deprecation logs excluded), by file (`typo3`, `typo3_solr`, …) and level. Error pages are counted separately:
+
+- `page`: an uncaught exception in a web request, the visitor or editor got an error page instead of the page
+- `content`: a content element replaced by "Oops, an error occurred!", the rest of the page rendered
+
+TYPO3 does not log 404 and 403, they are not counted.
+
+Each file is read backwards from its end, at most 8 MiB per file, so large logs stay cheap. When that limit cuts the 24 hours short, `complete` is `false` (`typo3_health_log_complete` 0) and the counts cover less time.
+
+TYPO3 writes messages with their line breaks. A message that carries visitor input can therefore contain lines that look like entries. Reading does not stop at the first entry older than the window, so a forged old date cannot hide the real entries before it; forged entries can still be counted. Treat the counts as an indicator, not as proof. Logs written elsewhere (custom writer configuration, syslog, rotated files) are not read.
+
+### Log entries (`/_api/health/logs`)
+
+The entries behind the log file counts, for importing them into a log store such as Loki. Same token as `/_api/health`, JSON only:
+
+```
+curl -H "Authorization: Bearer $TOKEN" "https://example.org/_api/health/logs?since=1793180401"
+```
+
+- `since`: Unix timestamp, entries from this second on. Default: the last 24 hours.
+- `entries`: oldest first, at most 500 per response. Each has `time`, `timestamp`, `log`, `level`, `component`, `requestId`, `exception` (short class), `errorPage` (`page`, `content` or `null`) and `message`.
+- `more`: there are further entries, call again with `since` set to `next`. The entries of that second come again, drop identical ones (Loki does this by itself). One request can log several entries in the same second, so request id and time alone are not unique.
+- `complete`: `false` when the 8 MiB read limit per file was reached before `since`, older entries are then not available.
+
+Messages are cleaned: the appended data (`- {json}`, which holds stack traces and request details) and stack traces are cut, a repeated exception message is dropped, query strings are replaced by `<query_stripped>` (`https://example.org/api<query_stripped>`, they carry tokens and keys), credentials in URLs by `[credentials]`, IP addresses, email addresses and paths outside the project by `[ip]`, `[email]` and `[path]`, project paths are made relative, the length is limited to 500 characters. Find the full entry with the request id in the log file.
