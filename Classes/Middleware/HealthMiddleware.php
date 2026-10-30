@@ -8,7 +8,9 @@ use ApacheSolrForTypo3\Solr\ConnectionManager;
 use ApacheSolrForTypo3\Solr\Domain\Site\Site as SolrSite;
 use ApacheSolrForTypo3\Solr\Domain\Site\SiteRepository as SolrSiteRepository;
 use ApacheSolrForTypo3\Solr\System\Solr\SolrConnection;
+use LINGNER\LinTypo3Health\Formatter\LogMessageFormatter;
 use LINGNER\LinTypo3Health\Formatter\PrometheusFormatter;
+use LINGNER\LinTypo3Health\Log\LogFileReader;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
@@ -26,7 +28,8 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Scheduler\CronCommand\CronCommand;
 
 /**
- * GET /_api/health: database, PHP-FPM, scheduler, Solr and system metrics for monitoring.
+ * GET /_api/health: database, PHP-FPM, scheduler, Solr, log and system metrics for monitoring.
+ * GET /_api/health/logs: the log entries behind the log counts.
  *
  * - Token from the environment or the extension configuration, sent as bearer
  *   via `Authorization` or `X-Authorization`; disabled without token.
@@ -40,6 +43,7 @@ use TYPO3\CMS\Scheduler\CronCommand\CronCommand;
 class HealthMiddleware implements MiddlewareInterface
 {
     private const PATH = '/_api/health';
+    private const LOGS_PATH = '/_api/health/logs';
     private const EXTENSION_KEY = 'lin_typo3_health';
     private const TOKEN_VARIABLE = 'TYPO3_HEALTH_ENDPOINT_BEARER';
 
@@ -69,6 +73,13 @@ class HealthMiddleware implements MiddlewareInterface
     // EXT:solr PingFailedException codes: no HTTP response vs. error response
     private const SOLR_PING_NO_RESPONSE = 1645716101;
 
+    // Backend log and log files are counted over the last 24 hours
+    private const LOG_WINDOW_SECONDS = 86400;
+    // sys_log.error, see SystemLogErrorClassification
+    private const SYS_LOG_ERROR_TYPES = [1 => 'user', 2 => 'system', 3 => 'security'];
+    // Entries per response of /_api/health/logs
+    private const LOGS_LIMIT = 500;
+
     public function __construct(
         private readonly ConnectionPool $connectionPool,
         private readonly LoggerInterface $logger,
@@ -77,7 +88,8 @@ class HealthMiddleware implements MiddlewareInterface
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
-        if (rtrim($request->getUri()->getPath(), '/') !== self::PATH) {
+        $path = rtrim($request->getUri()->getPath(), '/');
+        if ($path !== self::PATH && $path !== self::LOGS_PATH) {
             return $handler->handle($request);
         }
 
@@ -95,6 +107,10 @@ class HealthMiddleware implements MiddlewareInterface
             return $this->json(['error' => 'Method not allowed'], 405);
         }
 
+        if ($path === self::LOGS_PATH) {
+            return $this->logs($request);
+        }
+
         $startedAt = microtime(true);
         $warnings = [];
 
@@ -102,6 +118,8 @@ class HealthMiddleware implements MiddlewareInterface
         $fpm = $this->collectFpm($warnings);
         $scheduler = $database['reachable'] ? $this->collectScheduler($warnings) : null;
         $solr = $database['reachable'] ? $this->collectSolr($warnings) : null;
+        $sysLog = $database['reachable'] ? $this->collectSysLog() : null;
+        $errorLog = $this->collectErrorLog();
         $system = $this->collectSystem($warnings);
 
         $status = match (true) {
@@ -128,6 +146,8 @@ class HealthMiddleware implements MiddlewareInterface
             'fpm' => $fpm,
             'scheduler' => $scheduler,
             'solr' => $solr,
+            'sysLog' => $sysLog,
+            'errorLog' => $errorLog,
             'system' => $system,
             'durationMs' => round((microtime(true) - $startedAt) * 1000, 1),
         ];
@@ -173,6 +193,29 @@ class HealthMiddleware implements MiddlewareInterface
     private function warning(string $key, string $message): array
     {
         return ['key' => $key, 'message' => $message];
+    }
+
+    /**
+     * "1344 minutes (22 hours 24 minutes)", the breakdown only from one hour on.
+     */
+    private function formatMinutes(int $seconds): string
+    {
+        $minutes = intdiv(max(0, $seconds), 60);
+        $text = $minutes . ' ' . ($minutes === 1 ? 'minute' : 'minutes');
+        if ($minutes < 60) {
+            return $text;
+        }
+
+        $parts = [];
+        $rest = $minutes;
+        foreach (['day' => 1440, 'hour' => 60, 'minute' => 1] as $unit => $length) {
+            $value = intdiv($rest, $length);
+            $rest %= $length;
+            if ($value > 0) {
+                $parts[] = $value . ' ' . $unit . ($value === 1 ? '' : 's');
+            }
+        }
+        return $text . ' (' . implode(' ', $parts) . ')';
     }
 
     private function isAuthorized(ServerRequestInterface $request, string $expectedToken): bool
@@ -378,7 +421,7 @@ class HealthMiddleware implements MiddlewareInterface
                 $warnings[] = $this->warning('scheduler.task_failed.' . $row['uid'], sprintf('Task %d (%s) failed', $row['uid'], $name));
             }
             if ($threshold !== null && $runningSince !== null && $now - $runningSince > $threshold) {
-                $warnings[] = $this->warning('scheduler.task_running_long.' . $row['uid'], sprintf('Task %d (%s) running for %d minutes', $row['uid'], $name, intdiv($now - $runningSince, 60)));
+                $warnings[] = $this->warning('scheduler.task_running_long.' . $row['uid'], sprintf('Task %d (%s) running for %s', $row['uid'], $name, $this->formatMinutes($now - $runningSince)));
             }
 
             $tasks[] = [
@@ -401,9 +444,9 @@ class HealthMiddleware implements MiddlewareInterface
                 $warnings[] = $this->warning('scheduler.never_run', 'Scheduler has never run');
             } elseif ($now - $lastRunEnd > $shortestInterval * self::WARN_SCHEDULER_INTERVAL_RATIO) {
                 $warnings[] = $this->warning('scheduler.not_running', sprintf(
-                    'Scheduler has not run for %d minutes, shortest task interval is %d minutes',
-                    intdiv($now - $lastRunEnd, 60),
-                    intdiv($shortestInterval, 60)
+                    'Scheduler has not run for %s, shortest task interval is %s',
+                    $this->formatMinutes($now - $lastRunEnd),
+                    $this->formatMinutes($shortestInterval)
                 ));
             }
         }
@@ -434,8 +477,13 @@ class HealthMiddleware implements MiddlewareInterface
         }
 
         try {
-            [$cores, $servers] = $this->collectSolrCores($warnings);
-            $indexQueue = $this->collectSolrIndexQueue($warnings);
+            // EXT:solr is optional, its classes are only loaded once this runs
+            $sites = GeneralUtility::makeInstance(SolrSiteRepository::class)->getAvailableSites();
+            [$cores, $servers] = $this->collectSolrCores($sites, $warnings);
+            $indexQueue = $this->collectSolrIndexQueue(
+                array_map(static fn(SolrSite $site): int => $site->getRootPageId(), $sites),
+                $warnings
+            );
         } catch (\Throwable $e) {
             $this->logger->error('Health check: Solr status not readable', ['exception' => $e]);
             $warnings[] = $this->warning('solr.status_not_readable', 'Solr status not readable');
@@ -453,19 +501,19 @@ class HealthMiddleware implements MiddlewareInterface
      * Once a server gives no HTTP response, its remaining cores are not pinged:
      * a dead server costs one connect timeout instead of one per core.
      *
+     * @param list<SolrSite> $sites
      * @param list<array{key: string, message: string}> $warnings
      * @return array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}
      */
-    private function collectSolrCores(array &$warnings): array
+    private function collectSolrCores(array $sites, array &$warnings): array
     {
-        // EXT:solr is optional, its classes are only loaded once this runs
-        $siteRepository = GeneralUtility::makeInstance(SolrSiteRepository::class);
         $connectionManager = GeneralUtility::makeInstance(ConnectionManager::class);
 
         $cores = [];
         $servers = [];
         $deadServers = [];
-        foreach ($siteRepository->getAvailableSites() as $site) {
+        $unreachable = [];
+        foreach ($sites as $site) {
             foreach ($connectionManager->getConnectionsBySite($site) as $languageId => $connection) {
                 $endpoint = $connection->getEndpoint('read');
                 $server = $endpoint->getHost() . ':' . $endpoint->getPort();
@@ -498,20 +546,25 @@ class HealthMiddleware implements MiddlewareInterface
                     }
                 }
 
-                if (!$core['reachable']) {
-                    $warnings[] = $this->warning('solr.core_not_reachable.' . $server . '/' . $coreName, sprintf('Solr core %s not reachable', $coreName));
+                // Keyed by core name, hosts are not exposed. One warning per name:
+                // identical series would make Prometheus reject the scrape.
+                if (!$core['reachable'] && !isset($unreachable[$coreName])) {
+                    $unreachable[$coreName] = true;
+                    $warnings[] = $this->warning('solr.core_not_reachable.' . $coreName, sprintf('Solr core %s not reachable', $coreName));
                 }
                 $cores[$server . '/' . $coreName] = $core;
             }
         }
 
-        foreach ($servers as $server => $info) {
+        // Keyed by the index that is the server label in the Prometheus format
+        $servers = array_values(array_filter($servers));
+        foreach ($servers as $index => $info) {
             if (($info['heapRatio'] ?? 0) >= self::WARN_SOLR_HEAP_RATIO) {
-                $warnings[] = $this->warning('solr.heap_high.' . $server, sprintf('Solr heap at %d%%', (int) ($info['heapRatio'] * 100)));
+                $warnings[] = $this->warning('solr.heap_high.' . $index, sprintf('Solr heap at %d%%', (int) ($info['heapRatio'] * 100)));
             }
         }
 
-        return [array_values($cores), array_values(array_filter($servers))];
+        return [array_values($cores), $servers];
     }
 
     /**
@@ -551,29 +604,48 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
-     * Same criteria as the EXT:solr queue statistics, read without its internal API.
+     * Same criteria as the EXT:solr index queue worker, read without its internal
+     * API: only items of the current Solr sites, pending once changed and not
+     * scheduled for later. Leftovers of removed sites are never indexed and would
+     * report a stalled queue forever.
      *
+     * @param list<int> $rootPageIds
      * @param list<array{key: string, message: string}> $warnings
      * @return array<string, int|null>
      */
-    private function collectSolrIndexQueue(array &$warnings): array
+    private function collectSolrIndexQueue(array $rootPageIds, array &$warnings): array
     {
+        if ($rootPageIds === []) {
+            return [
+                'total' => 0,
+                'pending' => 0,
+                'failed' => 0,
+                'oldestPendingSeconds' => null,
+            ];
+        }
+
+        $now = time();
+        $pending = "errors = '' AND changed > indexed AND changed <= " . $now;
         $queryBuilder = $this->connectionPool->getQueryBuilderForTable('tx_solr_indexqueue_item');
         $row = $queryBuilder
             ->selectLiteral(
                 'COUNT(*) AS total',
                 "SUM(CASE WHEN errors <> '' THEN 1 ELSE 0 END) AS failed",
-                "SUM(CASE WHEN errors = '' AND changed > indexed THEN 1 ELSE 0 END) AS pending",
-                "MIN(CASE WHEN errors = '' AND changed > indexed THEN changed END) AS oldest_pending"
+                'SUM(CASE WHEN ' . $pending . ' THEN 1 ELSE 0 END) AS pending',
+                'MIN(CASE WHEN ' . $pending . ' THEN changed END) AS oldest_pending'
             )
             ->from('tx_solr_indexqueue_item')
+            ->where($queryBuilder->expr()->in(
+                'root',
+                $queryBuilder->createNamedParameter($rootPageIds, Connection::PARAM_INT_ARRAY)
+            ))
             ->executeQuery()
             ->fetchAssociative();
 
         $oldestPending = (int) ($row['oldest_pending'] ?? 0);
-        $oldestPendingAge = $oldestPending > 0 ? max(0, time() - $oldestPending) : null;
+        $oldestPendingAge = $oldestPending > 0 ? max(0, $now - $oldestPending) : null;
         if ($oldestPendingAge !== null && $oldestPendingAge > self::WARN_SOLR_QUEUE_STALLED_SECONDS) {
-            $warnings[] = $this->warning('solr.index_queue_stalled', sprintf('Solr index queue stalled for %d minutes', intdiv($oldestPendingAge, 60)));
+            $warnings[] = $this->warning('solr.index_queue_stalled', sprintf('Solr index queue stalled for %s', $this->formatMinutes($oldestPendingAge)));
         }
 
         return [
@@ -591,6 +663,137 @@ class HealthMiddleware implements MiddlewareInterface
         } catch (\Throwable) {
             return (string) $languageId;
         }
+    }
+
+    /**
+     * Backend log entries of the last 24 hours by error type. Counts only, the
+     * details may contain IP addresses and record titles.
+     *
+     * @return array{windowSeconds: int, errors: array<string, int>}|null
+     */
+    private function collectSysLog(): ?array
+    {
+        try {
+            $queryBuilder = $this->connectionPool->getQueryBuilderForTable('sys_log');
+            $queryBuilder->getRestrictions()->removeAll();
+            $rows = $queryBuilder
+                ->select('error')
+                ->addSelectLiteral('COUNT(*) AS entries')
+                ->from('sys_log')
+                ->where(
+                    $queryBuilder->expr()->gte('tstamp', $queryBuilder->createNamedParameter(time() - self::LOG_WINDOW_SECONDS, Connection::PARAM_INT)),
+                    $queryBuilder->expr()->in('error', $queryBuilder->createNamedParameter(array_keys(self::SYS_LOG_ERROR_TYPES), Connection::PARAM_INT_ARRAY))
+                )
+                ->groupBy('error')
+                ->executeQuery()
+                ->fetchAllAssociative();
+        } catch (\Throwable $e) {
+            $this->logger->error('Health check: sys_log not readable', ['exception' => $e]);
+            return null;
+        }
+
+        $errors = array_fill_keys(self::SYS_LOG_ERROR_TYPES, 0);
+        foreach ($rows as $row) {
+            $errors[self::SYS_LOG_ERROR_TYPES[(int) $row['error']]] = (int) $row['entries'];
+        }
+        return [
+            'windowSeconds' => self::LOG_WINDOW_SECONDS,
+            'errors' => $errors,
+        ];
+    }
+
+    /**
+     * Entries of level error and above of the last 24 hours in the TYPO3 log
+     * files by file and level, and the error pages among them, see
+     * LogFileReader. The entries themselves are served by /_api/health/logs.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function collectErrorLog(): ?array
+    {
+        $reader = $this->logFileReader();
+        $logs = $reader->logs();
+        if ($logs === []) {
+            return null;
+        }
+
+        $levels = array_fill_keys($logs, array_fill_keys(LogFileReader::LEVELS, 0));
+        $errorPages = ['page' => 0, 'content' => 0];
+        $entries = $reader->entries(time() - self::LOG_WINDOW_SECONDS);
+        foreach ($entries as $entry) {
+            $levels[$entry['log']][$entry['level']]++;
+            if ($entry['errorPage'] !== null) {
+                $errorPages[$entry['errorPage']]++;
+            }
+        }
+
+        return [
+            'windowSeconds' => self::LOG_WINDOW_SECONDS,
+            'complete' => $entries->getReturn(),
+            'levels' => $levels,
+            'errorPages' => $errorPages,
+        ];
+    }
+
+    /**
+     * GET /_api/health/logs?since=<unix timestamp>: log entries since then,
+     * oldest first, at most LOGS_LIMIT. With `more`, call again with
+     * since=`next`; entries of that second come again, consumers drop
+     * identical entries (one request can log several in the same second, so
+     * request id and time alone are not unique). Without since the last 24 hours.
+     */
+    private function logs(ServerRequestInterface $request): ResponseInterface
+    {
+        $since = (int) ($request->getQueryParams()['since'] ?? time() - self::LOG_WINDOW_SECONDS);
+        $found = $this->logFileReader()->entries($since);
+        $total = 0;
+        $entries = [];
+        foreach ($found as $entry) {
+            $total++;
+            $entries[] = $entry;
+            // Keeps memory flat however many entries the files hold
+            if (count($entries) >= 2 * self::LOGS_LIMIT) {
+                $entries = $this->oldestEntries($entries);
+            }
+        }
+        $entries = $this->oldestEntries($entries);
+        $more = $total > self::LOGS_LIMIT;
+        $last = $entries === [] ? $since : end($entries)['time'];
+        // A full response within one second would repeat forever, so continue after it
+        $next = $more && $entries[0]['time'] === $last ? $last + 1 : $last;
+
+        $formatter = new LogMessageFormatter(Environment::getProjectPath());
+        return $this->json([
+            'since' => $since,
+            'complete' => $found->getReturn(),
+            'more' => $more,
+            'next' => $next,
+            'entries' => array_map(
+                static fn(array $entry): array => [
+                    'time' => gmdate('c', $entry['time']),
+                    'timestamp' => $entry['time'],
+                    'message' => $formatter->format($entry['message']),
+                ] + $entry,
+                $entries
+            ),
+        ]);
+    }
+
+    /**
+     * The LOGS_LIMIT oldest entries, oldest first.
+     *
+     * @param list<array<string, mixed>> $entries
+     * @return list<array<string, mixed>>
+     */
+    private function oldestEntries(array $entries): array
+    {
+        usort($entries, static fn(array $a, array $b): int => $a['time'] <=> $b['time']);
+        return array_slice($entries, 0, self::LOGS_LIMIT);
+    }
+
+    private function logFileReader(): LogFileReader
+    {
+        return new LogFileReader(Environment::getVarPath() . '/log');
     }
 
     /**
