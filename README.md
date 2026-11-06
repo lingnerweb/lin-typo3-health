@@ -2,6 +2,10 @@
 
 Monitoring endpoint for TYPO3: `GET /_api/health` reports system metrics, database, PHP-FPM, scheduler, Solr and errors from the TYPO3 logs.
 
+It implements version 2 of the [health endpoint contract](https://github.com/lingnerweb/lin-grafana-monitoring/blob/main/CONTRACT.md), which the Node implementation serves as well, so both arrive in the same dashboards and alert rules.
+
+> **Upgrading from 1.x:** every metric is renamed from `typo3_health_` to `lin_health_`, `typo3_health_sys_log_errors` becomes `lin_health_log_backend_errors`, and the JSON keys `sysLog` and `errorLog` merge into `log`. Nothing is reported under both names. Until a project is updated, the monitoring renames the old metrics while scraping, so old and new endpoints work side by side during the rollout.
+
 ## Setup
 
 Add the repository and require the extension:
@@ -71,7 +75,9 @@ Both formats carry the same data. Counters (`Slow_queries`, `Connection_errors_m
 
 ### JSON
 
-Default format. Top-level keys: `status`, `warnings`, `hostname`, `time`, `typo3`, `php`, `database`, `fpm`, `scheduler`, `solr`, `sysLog`, `errorLog`, `system`, `durationMs`. Sections that are not available (no PHP-FPM, no EXT:solr, database down, no log file) are `null`.
+Default format. Top-level keys: `status`, `contract`, `version`, `platform`, `warnings`, `hostname`, `time`, `durationMs`, then one key per area: `database`, `system`, `fpm`, `php`, `scheduler`, `solr`, `log`. `typo3` carries what `info` has as a label. Areas that are not available (no PHP-FPM, no EXT:solr, database down, no log file) are `null`.
+
+`contract` is the version of the shared health endpoint contract, `version` the version of this extension and `platform` always `typo3`. They are what the monitoring branches on, see [CONTRACT.md](https://github.com/lingnerweb/lin-grafana-monitoring/blob/main/CONTRACT.md).
 
 Each warning is an object with `key` and `message`. The key follows the message as `<area>.<condition>[.<subject>]` and stays the same while the warning lasts, the message carries the current values:
 
@@ -105,21 +111,23 @@ Use the key to follow a warning across checks. Keys and messages contain no host
 curl -H "Authorization: Bearer $TOKEN" "https://example.org/_api/health?format=prometheus"
 ```
 
-Text exposition format, metrics prefixed with `typo3_health_`. Always `200`: Prometheus discards the body of non-2xx responses, so the state is in the metrics:
+Text exposition format, metrics prefixed with `lin_health_` — the prefix is shared with the other implementations of the contract, so one dashboard reads them all. Always `200`: Prometheus discards the body of non-2xx responses, so the state is in the metrics:
 
-- `typo3_health_status`: 0 ok, 1 degraded, 2 error
-- `typo3_health_database_up`
-- `typo3_health_warning{key="…", message="…"}`: one series per active warning. The message changes with its values, so group and alert by `key`, e.g. `max without (message) (typo3_health_warning)`
-- `typo3_health_info{typo3_version, php_version, …}`: versions as labels
-- `typo3_health_scheduler_task_*{uid="…"}`: one series per task, including `typo3_health_scheduler_task_interval_seconds`
-- `typo3_health_database_connection_ratio{limit="…"}`: `max_user_connections` or `max_connections`
-- `typo3_health_sys_log_errors{type="user|system|security"}`, `typo3_health_log_entries{log, level}`, `typo3_health_log_error_pages{type="page|content"}`: counts of the last 24 hours, see [Logs](#logs)
+- `lin_health_status`: 0 ok, 1 degraded, 2 error
+- `lin_health_database_up`
+- `lin_health_warning{key="…", message="…"}`: one series per active warning. The message changes with its values, so group and alert by `key`, e.g. `max without (message) (lin_health_warning)`
+- `lin_health_info{contract="2", version="…", platform="typo3", typo3_version, php_version, …}`: versions as labels
+- `lin_health_scheduler_task_*{uid="…"}`: one series per task, including `lin_health_scheduler_task_interval_seconds`
+- `lin_health_database_connection_ratio{limit="…"}`: `max_user_connections` or `max_connections`
+- `lin_health_log_backend_errors{type="user|system|security"}`, `lin_health_log_entries{log, level}`, `lin_health_log_error_pages{type="page|content"}`: counts of the last 24 hours, see [Logs](#logs)
+
+The scraper adds `project`, `project_name`, `customer` and `environment`, the extension sets none of them.
 
 ## Extensions
 
 ### Solr
 
-Active when EXT:solr is installed, otherwise `solr` is `null` and no `typo3_health_solr_*` metrics are written. Reports:
+Active when EXT:solr is installed, otherwise `solr` is `null` and no `lin_health_solr_*` metrics are written. Reports:
 
 - every core of every site: reachable, ping time, number of documents
 - per Solr server: version and JVM heap
@@ -133,11 +141,11 @@ Once a Solr server gives no response at all, its remaining cores are not pinged,
 
 Both are counted over the last 24 hours and raise no warning, alert on them in the monitoring.
 
-### Backend log (`sysLog`)
+### Backend log (`log.backendErrors`)
 
 Entries of `sys_log` (Backend → System → Log) with an error classification, by type: `user`, `system`, `security`. Counts only, the details contain IP addresses and record titles.
 
-### Log files (`errorLog`)
+### Log files (`log.levels`)
 
 Entries of level error and above in `var/log/typo3_*.log` (the default `FileWriter` files, deprecation logs excluded), by file (`typo3`, `typo3_solr`, …) and level. Error pages are counted separately:
 
@@ -146,7 +154,7 @@ Entries of level error and above in `var/log/typo3_*.log` (the default `FileWrit
 
 TYPO3 does not log 404 and 403, they are not counted.
 
-Each file is read backwards from its end, at most 8 MiB per file, so large logs stay cheap. When that limit cuts the 24 hours short, `complete` is `false` (`typo3_health_log_complete` 0) and the counts cover less time.
+Each file is read backwards from its end, at most 8 MiB per file, so large logs stay cheap. When that limit cuts the 24 hours short, `complete` is `false` (`lin_health_log_complete` 0) and the counts cover less time.
 
 TYPO3 writes messages with their line breaks. A message that carries visitor input can therefore contain lines that look like entries. Reading does not stop at the first entry older than the window, so a forged old date cannot hide the real entries before it; forged entries can still be counted. Treat the counts as an indicator, not as proof. Logs written elsewhere (custom writer configuration, syslog, rotated files) are not read.
 
