@@ -47,6 +47,11 @@ class HealthMiddleware implements MiddlewareInterface
     private const EXTENSION_KEY = 'lin_typo3_health';
     private const TOKEN_VARIABLE = 'TYPO3_HEALTH_ENDPOINT_BEARER';
 
+    /** Version of CONTRACT.md this implementation fulfills. */
+    private const CONTRACT_VERSION = 2;
+    /** What dashboards and alert rules branch on, see CONTRACT.md. */
+    private const PLATFORM = 'typo3';
+
     private const DB_STATUS_VARIABLES = [
         'Threads_connected',
         'Threads_running',
@@ -128,11 +133,18 @@ class HealthMiddleware implements MiddlewareInterface
             default => 'ok',
         };
 
+        // The general fields of CONTRACT.md, then one key per area. `typo3` is
+        // not an area: it carries what `info` has as a label, for whoever reads
+        // the JSON by hand.
         $payload = [
             'status' => $status,
+            'contract' => self::CONTRACT_VERSION,
+            'version' => $this->extensionVersion(),
+            'platform' => self::PLATFORM,
             'warnings' => $warnings,
             'hostname' => function_exists('gethostname') ? (gethostname() ?: null) : null,
             'time' => gmdate('c'),
+            'durationMs' => round((microtime(true) - $startedAt) * 1000, 1),
             'typo3' => [
                 'version' => (new Typo3Version())->getVersion(),
             ],
@@ -143,13 +155,11 @@ class HealthMiddleware implements MiddlewareInterface
                 'maxExecutionTime' => (int) ini_get('max_execution_time'),
             ],
             'database' => $database,
+            'system' => $system,
             'fpm' => $fpm,
             'scheduler' => $scheduler,
             'solr' => $solr,
-            'sysLog' => $sysLog,
-            'errorLog' => $errorLog,
-            'system' => $system,
-            'durationMs' => round((microtime(true) - $startedAt) * 1000, 1),
+            'log' => $this->mergeLog($sysLog, $errorLog),
         ];
 
         if (($request->getQueryParams()['format'] ?? null) === 'prometheus') {
@@ -182,6 +192,29 @@ class HealthMiddleware implements MiddlewareInterface
         } catch (\Throwable) {
             return $default;
         }
+    }
+
+    /**
+     * `ext_emconf.php` is the version of record: `composer.json` carries no
+     * version field, and in Composer mode TYPO3 fills the package metadata
+     * from the Composer version rather than from `ext_emconf.php` (see
+     * PackageArtifactBuilder), which is `dev-main` for an install from a
+     * branch. Reading the file reports the same version in both installation
+     * modes.
+     */
+    private function extensionVersion(): string
+    {
+        $path = dirname(__DIR__, 2) . '/ext_emconf.php';
+        if (!is_file($path)) {
+            return '';
+        }
+
+        // Both are read by the included file, the same way TYPO3 reads it.
+        $_EXTKEY = self::EXTENSION_KEY;
+        $EM_CONF = [];
+        include $path;
+
+        return (string) ($EM_CONF[self::EXTENSION_KEY]['version'] ?? '');
     }
 
     /**
@@ -736,6 +769,31 @@ class HealthMiddleware implements MiddlewareInterface
     }
 
     /**
+     * The log area, assembled from the two sources behind it: the log files
+     * and the backend log in `sys_log`. Either can be unavailable on its own —
+     * no log files, or the database gone — and then only its own keys are
+     * null. The area is null only when both are.
+     *
+     * @param array{windowSeconds: int, errors: array<string, int>}|null $sysLog
+     * @param array<string, mixed>|null $errorLog
+     * @return array<string, mixed>|null
+     */
+    private function mergeLog(?array $sysLog, ?array $errorLog): ?array
+    {
+        if ($sysLog === null && $errorLog === null) {
+            return null;
+        }
+
+        return [
+            'windowSeconds' => self::LOG_WINDOW_SECONDS,
+            'complete' => $errorLog['complete'] ?? null,
+            'levels' => $errorLog['levels'] ?? null,
+            'errorPages' => $errorLog['errorPages'] ?? null,
+            'backendErrors' => $sysLog['errors'] ?? null,
+        ];
+    }
+
+    /**
      * GET /_api/health/logs?since=<unix timestamp>: log entries since then,
      * oldest first, at most LOGS_LIMIT. With `more`, call again with
      * since=`next`; entries of that second come again, consumers drop
@@ -1052,7 +1110,7 @@ class HealthMiddleware implements MiddlewareInterface
 
     /**
      * Prometheus drops the body of non-2xx responses, so errors are reported
-     * via `typo3_health_status` instead of the HTTP status.
+     * via `lin_health_status` instead of the HTTP status.
      *
      * @param array<string, mixed> $payload
      */
