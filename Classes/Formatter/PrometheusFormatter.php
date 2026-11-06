@@ -12,7 +12,8 @@ namespace LINGNER\LinTypo3Health\Formatter;
  */
 class PrometheusFormatter
 {
-    private const PREFIX = 'typo3_health_';
+    /** Shared by every implementation of the contract, see CONTRACT.md. */
+    private const PREFIX = 'lin_health_';
 
     private const STATUS_VALUES = [
         'ok' => 0,
@@ -73,11 +74,8 @@ class PrometheusFormatter
         if ($payload['solr'] !== null) {
             $this->addSolr($payload['solr']);
         }
-        if ($payload['sysLog'] !== null) {
-            $this->addSysLog($payload['sysLog']);
-        }
-        if ($payload['errorLog'] !== null) {
-            $this->addErrorLog($payload['errorLog']);
+        if ($payload['log'] !== null) {
+            $this->addLog($payload['log']);
         }
         $this->addSystem($payload['system']);
 
@@ -101,8 +99,11 @@ class PrometheusFormatter
             'One series per active warning. The key identifies the warning, the message carries the current values.',
             array_map(static fn(array $warning): array => [$warning, 1], $payload['warnings'])
         );
-        $this->metric('info', 'gauge', 'Server information, the value is always 1.', [
+        $this->metric('info', 'gauge', 'Implementation information, the value is always 1.', [
             [[
+                'contract' => (string) $payload['contract'],
+                'version' => (string) $payload['version'],
+                'platform' => (string) $payload['platform'],
                 'hostname' => (string) $payload['hostname'],
                 'typo3_version' => $payload['typo3']['version'],
                 'php_version' => $payload['php']['version'],
@@ -262,38 +263,42 @@ class PrometheusFormatter
     }
 
     /**
-     * @param array{windowSeconds: int, errors: array<string, int>} $sysLog
-     */
-    private function addSysLog(array $sysLog): void
-    {
-        $this->metric('sys_log_errors', 'gauge', 'Backend log entries of the last 24 hours by error type.', array_map(
-            static fn(string $type, int $count): array => [['type' => $type], $count],
-            array_keys($sysLog['errors']),
-            $sysLog['errors']
-        ));
-    }
-
-    /**
      * Only counts, messages and recent entries stay in the JSON format.
      *
-     * @param array<string, mixed> $errorLog
+     * The two sources of the area fail independently: without log files there
+     * are no entries, without a database no backend log. A part that is
+     * missing writes no series rather than a zero.
+     *
+     * @param array<string, mixed> $log
      */
-    private function addErrorLog(array $errorLog): void
+    private function addLog(array $log): void
     {
         $entries = [];
-        foreach ($errorLog['levels'] as $log => $levels) {
+        foreach ($log['levels'] ?? [] as $file => $levels) {
             foreach ($levels as $level => $count) {
-                $entries[] = [['log' => (string) $log, 'level' => $level], $count];
+                $entries[] = [['log' => (string) $file, 'level' => $level], $count];
             }
         }
         $this->metric('log_entries', 'gauge', 'Log file entries of the last 24 hours by file and level, error and above.', $entries);
-        $this->metric('log_error_pages', 'gauge', 'Error pages of the last 24 hours: page is an uncaught exception, content a content element replaced by an error message.', [
-            [['type' => 'page'], $errorLog['errorPages']['page']],
-            [['type' => 'content'], $errorLog['errorPages']['content']],
-        ]);
-        $this->metric('log_complete', 'gauge', 'Whether the log files were read for the whole 24 hours, 0 when the read limit cut them short.', [
-            [[], $errorLog['complete'] ? 1 : 0],
-        ]);
+
+        if ($log['errorPages'] !== null) {
+            $this->metric('log_error_pages', 'gauge', 'Error pages of the last 24 hours: page is an uncaught exception, content a content element replaced by an error message.', [
+                [['type' => 'page'], $log['errorPages']['page']],
+                [['type' => 'content'], $log['errorPages']['content']],
+            ]);
+        }
+        if ($log['complete'] !== null) {
+            $this->metric('log_complete', 'gauge', 'Whether the log files were read for the whole 24 hours, 0 when the read limit cut them short.', [
+                [[], $log['complete'] ? 1 : 0],
+            ]);
+        }
+        if ($log['backendErrors'] !== null) {
+            $this->metric('log_backend_errors', 'gauge', 'Backend log entries of the last 24 hours by error type.', array_map(
+                static fn(string $type, int $count): array => [['type' => $type], $count],
+                array_keys($log['backendErrors']),
+                $log['backendErrors']
+            ));
+        }
     }
 
     /**
